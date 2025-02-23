@@ -1,48 +1,43 @@
 use std::borrow::Cow;
 
 use crate::{
-    page::Page,
+    page::Cell,
     pager::Pager,
+    pager::PositionedPage,
     value::Value,
 };
 
 #[derive(Debug)]
-pub struct Cursor<'p> {
+pub struct Cursor {
     header: RecordHeader,
-    pager: &'p mut Pager,
-    page_index: usize,
-    page_cell: usize,
+    payload: Vec<u8>,
 }
 
-impl<'p> Cursor<'p> {
+impl Cursor {
     pub fn field(&mut self, n: usize) -> Option<Value> {
         let record_field = self.header.fields.get(n)?;
 
-        let payload = match self.pager.read_page(self.page_index) {
-            Ok(Page::TableLeaf(leaf)) => &leaf.cells[self.page_cell].payload,
-            _ => return None,
-        };
-
         match record_field.field_type {
             RecordFieldType::Null => Some(Value::Null),
-            RecordFieldType::I8 => Some(Value::Int(read_i8_at(payload, record_field.offset))),
-            RecordFieldType::I16 => Some(Value::Int(read_i16_at(payload, record_field.offset))),
-            RecordFieldType::I24 => Some(Value::Int(read_i24_at(payload, record_field.offset))),
-            RecordFieldType::I32 => Some(Value::Int(read_i32_at(payload, record_field.offset))),
-            RecordFieldType::I48 => Some(Value::Int(read_i48_at(payload, record_field.offset))),
-            RecordFieldType::I64 => Some(Value::Int(read_i64_at(payload, record_field.offset))),
-            RecordFieldType::Float => Some(Value::Float(read_f64_at(payload, record_field.offset))),
+            RecordFieldType::I8 => Some(Value::Int(read_i8_at(&self.payload, record_field.offset))),
+            RecordFieldType::I16 => Some(Value::Int(read_i16_at(&self.payload, record_field.offset))),
+            RecordFieldType::I24 => Some(Value::Int(read_i24_at(&self.payload, record_field.offset))),
+            RecordFieldType::I32 => Some(Value::Int(read_i32_at(&self.payload, record_field.offset))),
+            RecordFieldType::I48 => Some(Value::Int(read_i48_at(&self.payload, record_field.offset))),
+            RecordFieldType::I64 => Some(Value::Int(read_i64_at(&self.payload, record_field.offset))),
+            RecordFieldType::Float => Some(Value::Float(read_f64_at(&self.payload, record_field.offset))),
             RecordFieldType::String(length) => {
                 let value = std::str::from_utf8(
-                    &payload[record_field.offset..record_field.offset + length],
+                    &self.payload[record_field.offset..record_field.offset + length],
                 ).expect("invalid utf8");
                 Some(Value::String(Cow::Borrowed(value)))
             }
             RecordFieldType::Blob(length) => {
-                let value = &payload[record_field.offset..record_field.offset + length];
+                let value = &self.payload[record_field.offset..record_field.offset + length];
                 Some(Value::Blob(Cow::Borrowed(value)))
             }
-            _ => panic!("unimplemented"),
+            RecordFieldType::One => Some(Value::Int(1)),
+            RecordFieldType::Zero => Some(Value::Int(0)),
         }
     }
 }
@@ -50,47 +45,82 @@ impl<'p> Cursor<'p> {
 #[derive(Debug)]
 pub struct Scanner<'p> {
     pager: &'p mut Pager,
-    page: usize,
-    cell: usize,
+    initial_page: usize,
+    page_stack: Vec<PositionedPage>,
 }
 
 impl<'p> Scanner<'p> {
     pub fn new(pager: &'p mut Pager, page: usize) -> Scanner<'p> {
         Scanner {
             pager,
-            page,
-            cell: 0,
+            initial_page: page,
+            page_stack: Vec::new(),
         }
     }
 
-    pub fn next_record(&mut self) -> Option<anyhow::Result<Cursor>> {
-        let page = match self.pager.read_page(self.page) {
-            Ok(page) => page,
-            Err(e) => return Some(Err(e)),
-        };
-
-        match page {
-            Page::TableLeaf(leaf) => {
-                let cell = leaf.cells.get(self.cell)?;
-
-                let header = match parse_record_header(&cell.payload) {
-                    Ok(header) => header,
-                    Err(e) => return Some(Err(e)),
-                };
-
-                let record = Cursor {
-                    header,
-                    pager: self.pager,
-                    page_index: self.page,
-                    page_cell: self.cell,
-                };
-
-                self.cell += 1;
-
-                Some(Ok(record))
+    pub fn next_record(&mut self) -> anyhow::Result<Option<Cursor>> {
+        loop {
+            match self.next_elem() {
+                Ok(Some(ScannerElem::Cursor(cursor))) => return Ok(Some(cursor)),
+                Ok(Some(ScannerElem::Page(page_num))) => {
+                    let new_page = self.pager.read_page(page_num as usize)?.clone();
+                    self.page_stack.push(PositionedPage {
+                        page: new_page,
+                        cell: 0,
+                    });
+                }
+                Ok(None) if self.page_stack.len() > 1 => {
+                    self.page_stack.pop();
+                }
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(e),
             }
         }
     }
+
+    fn next_elem(&mut self) -> anyhow::Result<Option<ScannerElem>> {
+        let Some(page) = self.current_page()? else {
+            return Ok(None);
+        };
+
+        if let Some(page) = page.next_page() {
+            return Ok(Some(ScannerElem::Page(page)));
+        }
+
+        let Some(cell) = page.next_cell() else {
+            return Ok(None);
+        };
+
+        match cell {
+            Cell::TableLeaf(cell) => {
+                let header = parse_record_header(&cell.payload)?;
+                Ok(Some(ScannerElem::Cursor(Cursor {
+                    header,
+                    payload: cell.payload.clone(),
+                })))
+            }
+            Cell::TableInterior(cell) => Ok(Some(ScannerElem::Page(cell.left_child_page))),
+        }
+    }
+
+    fn current_page(&mut self) -> anyhow::Result<Option<&mut PositionedPage>> {
+        if self.page_stack.is_empty() {
+            let page = match self.pager.read_page(self.initial_page) {
+                Ok(page) => page.clone(),
+                Err(e) => return Err(e),
+            };
+
+            self.page_stack.push(PositionedPage { page, cell: 0 });
+        }
+
+        Ok(self.page_stack.last_mut())
+    }
+}
+
+#[derive(Debug)]
+enum ScannerElem {
+    Page(u32),
+    Cursor(Cursor),
 }
 
 #[derive(Debug, Copy, Clone)]
